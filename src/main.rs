@@ -1,6 +1,17 @@
 use clap::Parser;
+use crossterm::event::{self, Event, KeyCode};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use crossterm::ExecutableCommand;
+use ratatui::backend::CrosstermBackend;
+use ratatui::style::{Color, Style};
+use ratatui::widgets::{Block, Borders, List, ListItem};
+use ratatui::{Frame, Terminal};
 use rocket::{routes, Config};
 use std::fs;
+use std::io;
+use std::iter::zip;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -33,6 +44,8 @@ enum MainError {
     Auth(AuthorizeError),
     #[error("Rocket error: {0}")]
     Rocket(rocket::Error),
+    #[error("IO error: {0}")]
+    IO(io::Error),
     #[error("Unknown error.")]
     Unknown,
 }
@@ -46,6 +59,12 @@ impl From<AuthorizeError> for MainError {
 impl From<rocket::Error> for MainError {
     fn from(err: rocket::Error) -> Self {
         MainError::Rocket(err)
+    }
+}
+
+impl From<io::Error> for MainError {
+    fn from(err: io::Error) -> Self {
+        MainError::IO(err)
     }
 }
 
@@ -127,11 +146,182 @@ async fn authorize(
     Ok((config, user_access))
 }
 
+struct ActionSelectionList {
+    action_names: Vec<&'static str>,
+    selected: Vec<bool>,
+    pub list_strings: Vec<String>,
+    index: usize,
+}
+
+fn list_format(name: &str, is_selected: bool) -> String {
+    format!("[{}] {}", if is_selected { 'X' } else { ' ' }, name)
+}
+
+impl ActionSelectionList {
+    fn new(action_names: &'static [&str], selected: &[bool]) -> Self {
+        let action_names = action_names.to_vec();
+        let selected = selected.to_vec();
+        let list_strings: Vec<_> = zip(action_names.iter(), selected.iter())
+            .map(|(name, is_selected)| list_format(name, *is_selected))
+            .collect();
+        Self {
+            action_names,
+            selected,
+            list_strings,
+            index: 0,
+        }
+    }
+
+    fn select(&mut self) {
+        self.selected[self.index] ^= true;
+        let is_selected = self.selected[self.index];
+        self.list_strings[self.index] = list_format(self.action_names[self.index], is_selected);
+    }
+
+    fn previous(&mut self) {
+        if self.index > 0 {
+            self.index -= 1;
+        }
+    }
+
+    fn next(&mut self) {
+        if self.index < self.action_names.len() - 1 {
+            self.index += 1;
+        }
+    }
+}
+
+static ACTION_NAMES: &[&str] = &[
+    "Create playlist of your short term top tracks",
+    "Create playlist of your medium term top tracks",
+    "Create playlist of your long term top tracks",
+];
+
+static DEFAULT_SELECTION: &[bool] = &[true, true, false];
+
+fn select_actions() -> Result<Option<ActionSelectionList>, io::Error> {
+    let mut selection = ActionSelectionList::new(ACTION_NAMES, DEFAULT_SELECTION);
+
+    enable_raw_mode()?;
+    io::stdout().execute(EnterAlternateScreen)?;
+
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+
+    let mut canceled = false;
+    let mut confirmed = false;
+    while !canceled && !confirmed {
+        terminal.draw(|frame| ui(frame, &selection))?;
+        match handle_events(&mut selection)? {
+            SelectionAction::Confirm => confirmed = true,
+            SelectionAction::Cancel => canceled = true,
+            SelectionAction::None => {}
+        }
+    }
+
+    disable_raw_mode()?;
+    io::stdout().execute(LeaveAlternateScreen)?;
+
+    if canceled {
+        Ok(None)
+    } else if confirmed {
+        Ok(Some(selection))
+    } else {
+        unreachable!()
+    }
+}
+
+fn ui(frame: &mut Frame, action_selection_list: &ActionSelectionList) {
+    let items = {
+        let mut actions: Vec<ListItem> = action_selection_list
+            .list_strings
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                if i != action_selection_list.index {
+                    ListItem::new(name.as_str())
+                } else {
+                    ListItem::new(name.as_str()).style(Style::default().bg(Color::DarkGray))
+                }
+            })
+            .collect();
+        let mut additional = vec![
+            ListItem::new("CONFIRM WITH 'SPACE'"),
+            ListItem::new("CANCEL WITH 'ESC' OR 'q'"),
+        ];
+        actions.append(&mut additional);
+        actions
+    };
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title("Spautofy Actions")
+                .borders(Borders::ALL),
+        )
+        .style(Style::default().fg(Color::White));
+    frame.render_widget(list, frame.size());
+}
+
+enum TuiAction {
+    Quit,
+    Confirm,
+    Select,
+    MoveUp,
+    MoveDown,
+}
+
+enum SelectionAction {
+    Confirm,
+    Cancel,
+    None,
+}
+
+fn handle_events(action_selection_list: &mut ActionSelectionList) -> io::Result<SelectionAction> {
+    if event::poll(std::time::Duration::from_millis(50))? {
+        if let Event::Key(key) = event::read()? {
+            if key.kind == event::KeyEventKind::Press {
+                let tui_action = match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => TuiAction::Quit,
+                    KeyCode::Char(' ') => TuiAction::Confirm,
+                    KeyCode::Enter => TuiAction::Select,
+                    KeyCode::Up | KeyCode::Char('k') => TuiAction::MoveUp,
+                    KeyCode::Down | KeyCode::Char('j') => TuiAction::MoveDown,
+                    _ => return Ok(SelectionAction::None),
+                };
+                match tui_action {
+                    TuiAction::Quit => return Ok(SelectionAction::Cancel),
+                    TuiAction::Confirm => return Ok(SelectionAction::Confirm),
+                    TuiAction::Select => action_selection_list.select(),
+                    TuiAction::MoveUp => action_selection_list.previous(),
+                    TuiAction::MoveDown => action_selection_list.next(),
+                }
+            }
+        }
+    }
+    Ok(SelectionAction::None)
+}
+
 #[rocket::main]
 async fn main() -> Result<(), MainError> {
     let args = Args::parse();
-    let file_config = parse_config_file(args.config_path.as_str());
+    let selection = select_actions()?;
+    let selection = match selection {
+        Some(selection) => selection,
+        None => {
+            println!("Stopped Spautofy.");
+            return Ok(());
+        }
+    };
 
+    println!("Selected Actions:");
+    selection
+        .action_names
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| selection.selected[*i])
+        .for_each(|(_, name)| println!("- {}", name));
+    println!();
+
+    let file_config = parse_config_file(args.config_path.as_str());
     let (config, user_access) = authorize(&args, file_config).await?;
     let _ = std::fs::write(
         args.config_path.as_str(),
@@ -142,10 +332,18 @@ async fn main() -> Result<(), MainError> {
         user_access.user.display_name
     );
 
-    println!("Creating top track playlist");
-    create_top_track_playlist(&user_access, TimeRange::ShortTerm).await?;
-    create_top_track_playlist(&user_access, TimeRange::MediumTerm).await?;
-    create_top_track_playlist(&user_access, TimeRange::LongTerm).await?;
+    if selection.selected[0] {
+        create_top_track_playlist(&user_access, TimeRange::ShortTerm).await?;
+    }
+    if selection.selected[1] {
+        create_top_track_playlist(&user_access, TimeRange::MediumTerm).await?;
+    }
+    if selection.selected[2] {
+        create_top_track_playlist(&user_access, TimeRange::LongTerm).await?;
+    }
+    if selection.selected[3] {
+        println!("Something else");
+    }
 
     Ok(())
 }
